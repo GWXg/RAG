@@ -1,0 +1,50 @@
+# Runtime data and generated knowledge-base files
+MUL_rag/mul_rag/backend/data/
+MUL_rag/mul_rag/backend/dataset_builder/
+MUL_rag/mul_rag/backend/preprocess_jobs/
+data/
+tuomin_filles/
+logs/
+nohup.out
+ollama_tuomin_mapping.json
+*.log
+*.pid
+*.bak
+MUL_rag/mul_rag/backend/=
+
+# Local caches and temporary files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Python virtual environments and local environment files
+.env
+.env.*
+!.env.example
+condarc*
+*.mirror.yml
+mul_rag_environment.yml
+.venv/
+venv/
+env/
+
+# Frontend dependencies and build outputs
+node_modules/
+dist/
+build/
+.vite/
+
+# Large local model/checkpoint artifacts
+MUL_rag/olmocr/
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.bin
+*.gguf
+
+# Local editor / agent artifacts
+.codex

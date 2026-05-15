@@ -1,0 +1,47 @@
+name: mul_rag
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pip
+  - ipykernel
+  - ipython
+  - fastapi
+  - uvicorn
+  - streamlit
+  - pandas
+  - openpyxl
+  - requests
+  - pydantic
+  - python-dotenv
+  - matplotlib
+  - pillow
+  - pymupdf
+  - pypdf
+  - pypdfium2
+  - pdf2image
+  - faiss-cpu
+  - pymysql
+  - tesseract
+  - poppler
+  - libmagic
+  - pip:
+      - langchain==1.2.0
+      - langchain-community==0.4.1
+      - langchain-core==1.2.1
+      - langchain-ollama==1.0.1
+      - langchain-openai==1.1.3
+      - langchain-text-splitters==1.1.0
+      - langchain-unstructured==1.0.0
+      - langgraph==1.0.5
+      - langgraph-prebuilt==1.0.5
+      - openai==2.12.0
+      - ollama==0.6.1
+      - html2text==2025.4.15
+      - pi-heif==1.1.1
+      - unstructured==0.18.21
+      - unstructured-client==0.42.4
+      - unstructured-inference==1.1.2
+      - unstructured-pytesseract==0.3.15
+      - PyPDF2==3.0.1

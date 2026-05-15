@@ -1,0 +1,21 @@
+# Minimal vLLM server dependencies for the existing `olmocr` environment used by MUL_rag.
+#
+# The official `olmocr` toolkit package requires Python >= 3.11. MUL_rag does not import that
+# toolkit at runtime; it renders PDF pages itself and sends them to a local OpenAI-compatible
+# vLLM server. Keep this file small so updating the existing `olmocr` env does not trigger a
+# Python version migration. Use `olmocr_environment.py311.yml` only when you need the official
+# toolkit package.
+name: olmocr
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - nodefaults
+dependencies:
+  - pip
+  - pip:
+      - --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+      - vllm==0.11.2
+      - transformers==4.57.3
+      - compressed-tensors==0.12.2
+      - flashinfer-python==0.5.2
+      - xformers==0.0.33.post1

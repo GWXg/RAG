@@ -1,0 +1,11 @@
+name: olmocr
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - -r /home/lrn/MUL_RAG/olmocr_pip_requirements.txt
