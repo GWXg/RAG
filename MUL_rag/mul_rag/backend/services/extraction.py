@@ -25,6 +25,13 @@ except ImportError:
     ChatOllama = None
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_EXTRACTION_MODEL = os.getenv("OLLAMA_EXTRACTION_MODEL", "qwen2.5:7b")
+
+# Local Ollama requests must not be sent through the machine-wide HTTP proxy.
+_no_proxy_hosts = {item.strip() for item in os.getenv("NO_PROXY", "").split(",") if item.strip()}
+_no_proxy_hosts.update({"127.0.0.1", "localhost", "::1"})
+os.environ["NO_PROXY"] = ",".join(sorted(_no_proxy_hosts))
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -442,7 +449,7 @@ def locate_relevant_content(full_text: str, query: str) -> (str, List[int]):
         return full_text[:100000], []
 
 
-def llm_extract(content: str, instruction: str, model_name: str = "qwen2.5:7b-instruct") -> List[Dict[str, Any]]:
+def llm_extract(content: str, instruction: str, model_name: str = "") -> List[Dict[str, Any]]:
     """
     Call LLM to extract data.
     """
@@ -452,6 +459,7 @@ def llm_extract(content: str, instruction: str, model_name: str = "qwen2.5:7b-in
     if not ChatOllama:
        raise ImportError("langchain_ollama not installed")
 
+    model_name = model_name or OLLAMA_EXTRACTION_MODEL
     llm = ChatOllama(
         model=model_name, 
         temperature=0,
@@ -497,10 +505,10 @@ def llm_extract(content: str, instruction: str, model_name: str = "qwen2.5:7b-in
         return data
     except json.JSONDecodeError:
         logger.error(f"Failed to decode JSON from LLM: {response.content}")
-        return [{"error": "Failed to parse LLM output", "raw": response.content}]
+        raise RuntimeError("Ollama 返回的提取结果不是合法 JSON")
     except Exception as e:
         logger.error(f"LLM extraction error: {e}")
-        return [{"error": str(e)}]
+        raise RuntimeError(f"Ollama 提取请求失败：{e}") from e
 
 
 def export_data(data: List[Dict[str, Any]], format_type: str, output_path: str):

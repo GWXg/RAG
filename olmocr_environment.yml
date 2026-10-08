@@ -2,15 +2,16 @@
 #
 # The official `olmocr` toolkit package requires Python >= 3.11. MUL_rag does not import that
 # toolkit at runtime; it renders PDF pages itself and sends them to a local OpenAI-compatible
-# vLLM server. Keep this file small so updating the existing `olmocr` env does not trigger a
-# Python version migration. Use `olmocr_environment.py311.yml` only when you need the official
-# toolkit package.
+# vLLM server. Python 3.14 is too new for vLLM 0.11.x wheels, so keep this
+# environment on Python 3.12. Use `olmocr_environment.py311.yml` only when you
+# need the official toolkit package.
 name: olmocr
 channels:
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
   - nodefaults
 dependencies:
+  - python=3.12
   - pip
   - pip:
       - --index-url https://pypi.tuna.tsinghua.edu.cn/simple

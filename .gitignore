@@ -10,10 +10,9 @@ ollama_tuomin_mapping.json
 *.log
 *.pid
 *.bak
-MUL_rag/mul_rag/backend/=
 
-# Local caches and temporary files
-__pycache__/
+#Local caches and temporary files
+# __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/

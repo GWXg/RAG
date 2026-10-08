@@ -40,6 +40,8 @@ from services.preprocessing import (
     preprocess_tabular_file,
     run_selected_preprocess_methods,
 )
+from services.preprocessing.methods.downhole_data_processing import run_grouped_preprocess_jobs
+from services.preprocessing.registry import get_preprocess_methods
 from fastapi.responses import StreamingResponse, JSONResponse
 from services.rag_service import retrieve, answer_stream, clear_history
 from services.extraction import (
@@ -49,6 +51,14 @@ from services.extraction import (
     llm_extract,
     export_data,
 )
+from services.structured_db_service import (
+    connect_structured_db,
+    disconnect_structured_db,
+    get_structured_db_schema,
+    list_structured_db_connections,
+    preview_structured_db_table,
+)
+from services.query_agent_service import run_query
 
 app = FastAPI(
     title="多模态RAG系统API",
@@ -152,6 +162,90 @@ def _normalize_file_ids(payload: Dict[str, Any]) -> List[str]:
 @app.get(f"{API_PREFIX}/health", tags=["Health"])
 async def health():
     return {"ok": True, "version": "1.0.0"}
+
+# ---------------- Structured database ----------------
+
+class StructuredDbDisconnectRequest(BaseModel):
+    connectionId: str
+
+
+class UnifiedQueryRequest(BaseModel):
+    message: str
+    mode: str = "vector"
+    kbId: Optional[str] = None
+    fileId: Optional[str] = None
+    connectionId: Optional[str] = None
+    sqlLimit: int = 100
+    sessionId: Optional[str] = None
+
+
+@app.get(f"{API_PREFIX}/structured-db/connections", tags=["Structured DB"])
+async def structured_db_connections():
+    return {"connections": list_structured_db_connections()}
+
+
+@app.post(f"{API_PREFIX}/structured-db/connect", tags=["Structured DB"])
+async def structured_db_connect(config: Dict[str, Any] = Body(...)):
+    try:
+        return {"connection": connect_structured_db(config)}
+    except FileNotFoundError as exc:
+        return JSONResponse(err("DATABASE_FILE_NOT_FOUND", str(exc)), status_code=400)
+    except (ValueError, RuntimeError, ConnectionError) as exc:
+        return JSONResponse(err("DATABASE_CONNECT_FAILED", str(exc)), status_code=400)
+    except Exception as exc:
+        return JSONResponse(err("DATABASE_CONNECT_FAILED", str(exc)), status_code=500)
+
+
+@app.post(f"{API_PREFIX}/structured-db/disconnect", tags=["Structured DB"])
+async def structured_db_disconnect(req: StructuredDbDisconnectRequest):
+    return disconnect_structured_db(req.connectionId)
+
+
+@app.get(f"{API_PREFIX}/structured-db/schema", tags=["Structured DB"])
+async def structured_db_schema(connectionId: str = Query(...)):
+    try:
+        return get_structured_db_schema(connectionId)
+    except KeyError as exc:
+        return JSONResponse(err("DATABASE_CONNECTION_NOT_FOUND", str(exc)), status_code=404)
+    except Exception as exc:
+        return JSONResponse(err("DATABASE_SCHEMA_FAILED", str(exc)), status_code=500)
+
+
+@app.get(f"{API_PREFIX}/structured-db/table", tags=["Structured DB"])
+async def structured_db_table(
+    connectionId: str = Query(...),
+    table: str = Query(...),
+    schema: str = Query(""),
+    limit: int = Query(100),
+    offset: int = Query(0),
+):
+    try:
+        return preview_structured_db_table(connectionId, table, schema=schema, limit=limit, offset=offset)
+    except KeyError as exc:
+        return JSONResponse(err("DATABASE_TABLE_NOT_FOUND", str(exc)), status_code=404)
+    except Exception as exc:
+        return JSONResponse(err("DATABASE_TABLE_PREVIEW_FAILED", str(exc)), status_code=500)
+
+
+@app.post(f"{API_PREFIX}/query", tags=["Query"])
+async def unified_query(req: UnifiedQueryRequest):
+    """统一执行向量检索、Text-to-SQL、混合检索或 Agent 查询。"""
+    try:
+        return await run_query(
+            question=req.message,
+            mode=req.mode,
+            kb_id=req.kbId,
+            file_id=req.fileId,
+            connection_id=req.connectionId,
+            sql_limit=max(1, min(int(req.sqlLimit or 100), 500)),
+            session_id=req.sessionId,
+        )
+    except ValueError as exc:
+        return JSONResponse(err("INVALID_QUERY", str(exc)), status_code=400)
+    except KeyError as exc:
+        return JSONResponse(err("QUERY_RESOURCE_NOT_FOUND", str(exc)), status_code=404)
+    except Exception as exc:
+        return JSONResponse(err("QUERY_FAILED", str(exc)), status_code=500)
 
 # ---------------- Chat（SSE，POST 返回 event-stream） ----------------
 class ChatRequest(BaseModel):
@@ -440,6 +534,17 @@ async def kb_files(kbId: str = Query(...)):
 
     return {"kbId": kb_id, "files": items}
 
+
+@app.get(f"{API_PREFIX}/file-manager/wells", tags=["File Manager"])
+async def file_manager_wells():
+    """返回文件管理页使用的井、分类和规范文档聚合数据。"""
+    from services.well_file_manager import build_well_file_manager
+
+    try:
+        return build_well_file_manager(DATA_ROOT, RESERVED_DATA_DIRS)
+    except Exception as exc:
+        return JSONResponse(err("FILE_MANAGER_FAILED", str(exc)), status_code=500)
+
 @app.get(f"{API_PREFIX}/kb/images", tags=["KB"])
 async def kb_images_all(kbId: str = Query(...)):
     """获取知识库下所有文件的图片摘要列表"""
@@ -593,6 +698,32 @@ async def kb_file_content(kbId: str = Query(...), fileId: str = Query(...)):
              return JSONResponse(err("READ_ERROR", f"无法读取文件: {str(e)}"), status_code=500)
 
     return JSONResponse(err("FILE_NOT_FOUND", "文件内容不存在"), status_code=404)
+
+
+@app.get(f"{API_PREFIX}/kb/file/original", tags=["KB"])
+async def kb_file_original(kbId: str = Query(...), fileId: str = Query(...)):
+    """返回知识库文件的原始文件，用于文件管理中的预览。"""
+    from mimetypes import guess_type
+
+    file_path = original_pdf_path(kbId, fileId)
+    if not file_path.exists():
+        # 文件管理聚合了多个知识库；兼容历史数据中 kbId 标注不一致的文件。
+        for candidate_kb_dir in DATA_ROOT.iterdir() if DATA_ROOT.exists() else []:
+            if not candidate_kb_dir.is_dir() or candidate_kb_dir.name in RESERVED_DATA_DIRS:
+                continue
+            candidate = original_pdf_path(candidate_kb_dir.name, fileId)
+            if candidate.exists():
+                file_path = candidate
+                break
+    if not file_path.exists() or not file_path.is_file():
+        return JSONResponse(err("FILE_NOT_FOUND", "原始文件不存在"), status_code=404)
+
+    media_type = guess_type(file_path.name)[0] or "application/octet-stream"
+    return FileResponse(
+        str(file_path),
+        media_type=media_type,
+        headers={"Content-Disposition": "inline"},
+    )
 
 # ---------------- PDF: 上传（支持指定 kbId） ----------------
 
@@ -1059,6 +1190,7 @@ class PreprocessRequest(BaseModel):
 class PreprocessWorkbenchRunRequest(BaseModel):
     jobId: str
     methods: List[str]
+    algorithmSelections: Optional[Dict[str, str]] = None
     targetKbId: Optional[str] = None
     newKbName: Optional[str] = None
     saveToKb: Optional[bool] = True
@@ -1069,6 +1201,15 @@ class PreprocessWorkbenchStoreRequest(BaseModel):
     targetKbId: Optional[str] = None
     newKbName: Optional[str] = None
     rebuildIndex: Optional[bool] = False
+
+class PreprocessGroupedJobRequest(BaseModel):
+    jobId: str
+    role: Optional[str] = None
+
+class PreprocessGroupedRunRequest(BaseModel):
+    method: str
+    jobs: List[PreprocessGroupedJobRequest]
+    config: Optional[Dict[str, Any]] = None
 
 def _preprocess_job_dir(job_id: str) -> Path:
     safe_job_id = re.sub(r"[^A-Za-z0-9_-]", "", str(job_id or ""))
@@ -1089,6 +1230,17 @@ def _read_preprocess_job_meta(job_id: str) -> Dict[str, Any]:
     except Exception:
         raise HTTPException(status_code=500, detail="PREPROCESS_JOB_META_ERROR")
 
+def _preprocess_result_path(job_id: str) -> Path:
+    meta = _read_preprocess_job_meta(job_id)
+    result_path = Path(str(meta.get("resultPath") or "")) if meta.get("resultPath") else None
+    if result_path and result_path.exists() and result_path.is_file():
+        try:
+            result_path.resolve().relative_to(PREPROCESS_WORK_ROOT.resolve())
+            return result_path
+        except ValueError:
+            raise HTTPException(status_code=400, detail="INVALID_PREPROCESS_OUTPUT_PATH")
+    return _preprocess_job_dir(job_id) / "output" / "standardized.csv"
+
 def _store_preprocess_output_to_kb(
     job_id: str,
     target_kb_id: Optional[str] = None,
@@ -1096,7 +1248,7 @@ def _store_preprocess_output_to_kb(
     rebuild_index: bool = False,
 ) -> Dict[str, Any]:
     meta = _read_preprocess_job_meta(job_id)
-    output_path = _preprocess_job_dir(job_id) / "output" / "standardized.csv"
+    output_path = _preprocess_result_path(job_id)
     report_path = _preprocess_job_dir(job_id) / "output" / "report.json"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="PREPROCESS_OUTPUT_NOT_FOUND")
@@ -1139,7 +1291,7 @@ def _store_preprocess_output_to_kb(
         kb_files_dir(final_kb_id)
 
     original_stem = Path(meta.get("fileName") or output_path.name).stem
-    output_name = f"{_slugify_kb_name(original_stem) or 'preprocessed'}_preprocessed.csv"
+    output_name = f"{_slugify_kb_name(original_stem) or 'preprocessed'}_preprocessed{output_path.suffix.lower() or '.csv'}"
     file_id = _allocate_file_id(final_kb_id, output_name)
     saved = save_upload(final_kb_id, file_id, output_path.read_bytes(), output_name)
     write_parse_metadata(
@@ -1167,14 +1319,15 @@ def _store_preprocess_output_to_kb(
 
 @app.get(f"{API_PREFIX}/preprocess/methods", tags=["Preprocess"])
 async def preprocess_methods():
-    return {"methods": PREPROCESS_METHODS}
+    custom_methods = get_preprocess_methods()
+    return {"methods": [*PREPROCESS_METHODS, *[item for item in custom_methods if item.get("id") not in {method["id"] for method in PREPROCESS_METHODS}]]}
 
 @app.post(f"{API_PREFIX}/preprocess/upload", tags=["Preprocess"])
 async def preprocess_upload(file: UploadFile = File(...)):
     filename = file.filename or "uploaded.csv"
     suffix = Path(filename).suffix.lower()
-    if suffix not in {".csv", ".xlsx", ".xls", ".json", ".jsonl"}:
-        return JSONResponse(err("UNSUPPORTED_PREPROCESS_FILE", "当前预处理工作台支持 CSV/Excel/JSON/JSONL"), status_code=400)
+    if suffix not in {".csv", ".xlsx", ".xls", ".json", ".jsonl", ".las"}:
+        return JSONResponse(err("UNSUPPORTED_PREPROCESS_FILE", "当前预处理工作台支持 CSV/Excel/JSON/JSONL/LAS"), status_code=400)
 
     job_id = rid("prep")
     job_dir = _preprocess_job_dir(job_id)
@@ -1195,6 +1348,76 @@ async def preprocess_upload(file: UploadFile = File(...)):
     }
     _preprocess_job_meta_path(job_id).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, **meta}
+
+@app.post(f"{API_PREFIX}/preprocess/workbench/grouped/run", tags=["Preprocess"])
+async def preprocess_workbench_grouped_run(req: PreprocessGroupedRunRequest):
+    if (req.method or "").strip() != "downhole_data_processing":
+        return JSONResponse(err("UNSUPPORTED_GROUPED_METHOD", "不支持的组合文件预处理方法"), status_code=400)
+    if not req.jobs:
+        return JSONResponse(err("PREPROCESS_JOBS_REQUIRED", "请先上传井下数据处理所需文件"), status_code=400)
+
+    job_sources: List[Dict[str, Any]] = []
+    try:
+        for requested_job in req.jobs:
+            source_meta = _read_preprocess_job_meta((requested_job.jobId or "").strip())
+            source_path = Path(str(source_meta.get("sourcePath") or ""))
+            if not source_path.exists() or not source_path.is_file():
+                raise FileNotFoundError(source_meta.get("fileName") or requested_job.jobId)
+            job_sources.append({**source_meta, "role": (requested_job.role or "").strip()})
+
+        grouped_job_id = rid("prepgroup")
+        grouped_job_dir = _preprocess_job_dir(grouped_job_id)
+        output_dir = grouped_job_dir / "output"
+        grouped_job_dir.mkdir(parents=True, exist_ok=True)
+        grouped_meta = {
+            "jobId": grouped_job_id,
+            "fileName": "井下数据处理结果",
+            "sourcePath": "",
+            "createdAt": now_ts(),
+            "grouped": True,
+        }
+        _preprocess_job_meta_path(grouped_job_id).write_text(json.dumps(grouped_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        report = run_grouped_preprocess_jobs(
+            job_sources=job_sources,
+            output_dir=output_dir,
+            config=req.config or {},
+            grouped_job_id=grouped_job_id,
+        )
+
+        output_jobs: List[Dict[str, Any]] = []
+        for output_file in report.get("outputFiles", []):
+            if not isinstance(output_file, dict):
+                continue
+            artifact_path = (output_dir / str(output_file.get("path") or "")).resolve()
+            try:
+                artifact_path.relative_to(output_dir.resolve())
+            except ValueError:
+                continue
+            if not artifact_path.exists() or not artifact_path.is_file():
+                continue
+            output_job_id = rid("prepout")
+            output_job_dir = _preprocess_job_dir(output_job_id)
+            output_job_dir.mkdir(parents=True, exist_ok=True)
+            output_meta = {
+                "jobId": output_job_id,
+                "fileName": artifact_path.name,
+                "storedName": artifact_path.name,
+                "sourcePath": str(artifact_path),
+                "resultPath": str(artifact_path),
+                "groupOutputRoot": str(output_dir),
+                "parentJobId": grouped_job_id,
+                "size": artifact_path.stat().st_size,
+                "createdAt": now_ts(),
+            }
+            _preprocess_job_meta_path(output_job_id).write_text(json.dumps(output_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            output_jobs.append({**output_file, **output_meta, "suffix": artifact_path.suffix.lower().lstrip(".")})
+
+        report["outputJobs"] = output_jobs
+        return report
+    except FileNotFoundError as exc:
+        return JSONResponse(err("PREPROCESS_SOURCE_NOT_FOUND", f"预处理源文件不存在: {exc}"), status_code=404)
+    except Exception as exc:
+        return JSONResponse(err("PREPROCESS_GROUPED_ERROR", str(exc)), status_code=500)
 
 @app.post(f"{API_PREFIX}/preprocess/workbench/run", tags=["Preprocess"])
 async def preprocess_workbench_run(req: PreprocessWorkbenchRunRequest):
@@ -1217,7 +1440,12 @@ async def preprocess_workbench_run(req: PreprocessWorkbenchRunRequest):
 
     try:
         output_dir = _preprocess_job_dir(job_id) / "output"
-        report = run_selected_preprocess_methods(source_path, output_dir=output_dir, methods=methods)
+        report = run_selected_preprocess_methods(
+            source_path,
+            output_dir=output_dir,
+            methods=methods,
+            algorithm_selections=req.algorithmSelections,
+        )
     except Exception as exc:
         return JSONResponse(err("PREPROCESS_ERROR", str(exc)), status_code=500)
 
@@ -1263,16 +1491,53 @@ async def preprocess_workbench_store(req: PreprocessWorkbenchStoreRequest):
     except Exception as exc:
         return JSONResponse(err("PREPROCESS_STORE_ERROR", str(exc)), status_code=500)
 
+@app.get(f"{API_PREFIX}/preprocess/workbench/download", tags=["Preprocess"])
+async def preprocess_workbench_download(jobId: str = Query(...), format: str = Query("csv")):
+    output_path = _preprocess_result_path(jobId)
+    if not output_path.exists() or not output_path.is_file():
+        return JSONResponse(err("PREPROCESS_OUTPUT_NOT_FOUND", "尚未生成预处理结果"), status_code=404)
+    requested_format = (format or "").strip().lower()
+    if requested_format == "xlsx" and output_path.suffix.lower() == ".csv":
+        import pandas as pd
+
+        xlsx_path = _preprocess_job_dir(jobId) / "output" / "standardized.xlsx"
+        xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.read_csv(output_path).to_excel(xlsx_path, index=False)
+        output_path = xlsx_path
+    return FileResponse(str(output_path), filename=output_path.name)
+
+@app.get(f"{API_PREFIX}/preprocess/workbench/artifact/download", tags=["Preprocess"])
+async def preprocess_workbench_artifact_download(jobId: str = Query(...), path: str = Query(...)):
+    meta = _read_preprocess_job_meta(jobId)
+    root = Path(str(meta.get("groupOutputRoot") or (_preprocess_job_dir(jobId) / "output"))).resolve()
+    artifact_path = (root / path).resolve()
+    try:
+        artifact_path.relative_to(root)
+    except ValueError:
+        return JSONResponse(err("INVALID_PATH", "无效的预处理产物路径"), status_code=400)
+    if not artifact_path.exists() or not artifact_path.is_file():
+        return JSONResponse(err("PREPROCESS_ARTIFACT_NOT_FOUND", "预处理产物不存在"), status_code=404)
+    return FileResponse(str(artifact_path), filename=artifact_path.name)
+
 @app.get(f"{API_PREFIX}/preprocess/workbench/dataframe", tags=["Preprocess"])
 async def preprocess_workbench_dataframe(jobId: str = Query(...), limit: int = Query(500, ge=1, le=5000)):
-    _read_preprocess_job_meta(jobId)
-    output_path = _preprocess_job_dir(jobId) / "output" / "standardized.csv"
+    output_path = _preprocess_result_path(jobId)
     if not output_path.exists():
         return JSONResponse(err("PREPROCESS_OUTPUT_NOT_FOUND", "尚未生成标准化数据"), status_code=404)
     try:
         import pandas as pd
 
-        df = pd.read_csv(output_path)
+        suffix = output_path.suffix.lower()
+        if suffix == ".csv":
+            df = pd.read_csv(output_path)
+        elif suffix in {".xlsx", ".xls"}:
+            df = pd.read_excel(output_path)
+        elif suffix == ".jsonl":
+            df = pd.read_json(output_path, lines=True)
+        elif suffix == ".json":
+            df = pd.read_json(output_path)
+        else:
+            return {"jobId": jobId, "rows": [], "columns": [], "totalRows": 0, "limit": limit, "previewUnsupported": True}
         total_rows = len(df)
         preview = df.head(limit).replace([float("inf"), float("-inf")], float("nan"))
         preview = preview.astype(object).where(pd.notnull(preview), None)
@@ -1446,6 +1711,36 @@ async def index_delete(req: BuildIndexRequest):
     return {"ok": not failed, "total": len(file_ids), "results": results}
 # ---------------- Knowledge Extraction ----------------
 
+@app.get(f"{API_PREFIX}/extraction/check_filename", tags=["Extraction"])
+async def check_extraction_filename(
+    kbId: str = Query(...),
+    filename: str = Query(...),
+):
+    """检查提取结果文件名是否已存在于目标知识库。"""
+    kb_id = (kbId or "").strip()
+    requested_name = Path(filename or "").name.strip()
+    if not kb_id or not requested_name:
+        raise HTTPException(status_code=400, detail="KB_ID_AND_FILENAME_REQUIRED")
+
+    conflicts = []
+    files_root = DATA_ROOT / kb_id / "files"
+    if files_root.exists():
+        requested_key = requested_name.casefold()
+        for file_dir in files_root.iterdir():
+            if not file_dir.is_dir():
+                continue
+            for candidate in file_dir.iterdir():
+                if candidate.is_file() and candidate.name.casefold() == requested_key:
+                    conflicts.append({"fileId": file_dir.name, "fileName": candidate.name})
+                    break
+
+    return {
+        "kbId": kb_id,
+        "filename": requested_name,
+        "exists": bool(conflicts),
+        "conflicts": conflicts,
+    }
+
 @app.post(f"{API_PREFIX}/extraction/extract", tags=["Extraction"])
 async def run_extraction(
     background_tasks: BackgroundTasks,
@@ -1454,7 +1749,8 @@ async def run_extraction(
     kb_id: str = Form(""),
     output_format: str = Form("excel"),
     custom_filename: str = Form(""),
-    parse_method: str = Form("original")
+    parse_method: str = Form("original"),
+    overwrite_existing: bool = Form(False),
 ):
     try:
         # 1. Save file synchronously to ensure it's on disk
@@ -1474,7 +1770,7 @@ async def run_extraction(
         }
 
         # 3. Define Worker
-        def _extraction_worker(jid: str, fpath: str, instr: str, kbid: str, fmt: str, cname: str, p_method: str):
+        def _extraction_worker(jid: str, fpath: str, instr: str, kbid: str, fmt: str, cname: str, p_method: str, overwrite: bool):
             job = EXTRACTION_JOBS[jid]
             try:
                 # -- Stage 1: Parsing --
@@ -1529,6 +1825,15 @@ async def run_extraction(
 
                 # -- Stage 5: KB Integration --
                 new_fid = _allocate_file_id(kbid, out_filename)
+                if overwrite:
+                    files_root = DATA_ROOT / kbid / "files"
+                    requested_key = out_filename.casefold()
+                    for file_dir in files_root.iterdir() if files_root.exists() else []:
+                        if not file_dir.is_dir():
+                            continue
+                        if any(item.is_file() and item.name.casefold() == requested_key for item in file_dir.iterdir()):
+                            new_fid = file_dir.name
+                            break
                 kb_file_dir = workdir(kbid, new_fid)
                 kb_file_dir.mkdir(parents=True, exist_ok=True)
                 kb_file_path = kb_file_dir / out_filename
@@ -1552,7 +1857,7 @@ async def run_extraction(
         # 4. Launch Background Task
         background_tasks.add_task(
             _extraction_worker, 
-            job_id, saved_path, instruction, kb_id, output_format, custom_filename, parse_method
+            job_id, saved_path, instruction, kb_id, output_format, custom_filename, parse_method, overwrite_existing
         )
 
         return {"jobId": job_id, "status": "pending"}

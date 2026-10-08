@@ -174,6 +174,10 @@ def workdir(kb_id: str, file_id: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+def _workdir_path(kb_id: str, file_id: str) -> Path:
+    """只计算工作目录路径，供读取操作使用，避免查询不存在的文件时创建空目录。"""
+    return DATA_ROOT / kb_id / "files" / file_id
+
 def kb_metadata_path(kb_id: str) -> Path:
     return kb_dir(kb_id) / "meta.json"
 
@@ -208,7 +212,7 @@ def original_pdf_path(kb_id: str, file_id: str, filename: str = None) -> Path:
     如果提供了 filename，则使用该文件名（用于保存时）。
     如果不提供 filename，则尝试查找目录下已存在的主文件（用于读取时）。
     """
-    wd = workdir(kb_id, file_id)
+    wd = workdir(kb_id, file_id) if filename else _workdir_path(kb_id, file_id)
     if filename:
         return wd / filename
     
@@ -222,10 +226,10 @@ def original_pdf_path(kb_id: str, file_id: str, filename: str = None) -> Path:
     return wd / file_id
 
 def markdown_output(kb_id: str, file_id: str) -> Path:
-    return workdir(kb_id, file_id) / "output.md"
+    return _workdir_path(kb_id, file_id) / "output.md"
 
 def parse_metadata_path(kb_id: str, file_id: str) -> Path:
-    return workdir(kb_id, file_id) / "parse_meta.json"
+    return _workdir_path(kb_id, file_id) / "parse_meta.json"
 
 def read_parse_metadata(kb_id: str, file_id: str) -> Dict[str, Any]:
     path = parse_metadata_path(kb_id, file_id)
@@ -239,7 +243,9 @@ def read_parse_metadata(kb_id: str, file_id: str) -> Dict[str, Any]:
 
 def write_parse_metadata(kb_id: str, file_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     data = {"updatedAt": int(time.time()), **meta}
-    parse_metadata_path(kb_id, file_id).write_text(
+    path = parse_metadata_path(kb_id, file_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

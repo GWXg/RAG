@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT_DIR="/home/lrn/MUL_RAG"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$ROOT_DIR/MUL_rag/mul_rag"
 BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_APP="$PROJECT_DIR/streamlit_app.py"

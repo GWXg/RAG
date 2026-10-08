@@ -5,9 +5,14 @@ import time
 import os
 import re
 import html
+import io
 import pandas as pd
 import urllib.parse
 import base64
+from pathlib import Path
+
+PARSE_MONITOR_MAX_RETRIES = int(os.getenv("PARSE_MONITOR_MAX_RETRIES", "9600"))
+PARSE_STATUS_TIMEOUT = int(os.getenv("PARSE_STATUS_TIMEOUT", "5"))
 
 # 设置页面配置
 st.set_page_config(
@@ -182,6 +187,11 @@ PREPROCESS_METHOD_CARDS = [
         "description": "统一表头、空值标记、空白字符和基础类型。",
     },
     {
+        "id": "las_to_excel",
+        "name": "LAS 转 Excel",
+        "description": "解析 LAS 测井曲线、井信息和空值标记，并输出标准 Excel 文件。",
+    },
+    {
         "id": "dedupe",
         "name": "冗余数据剔除",
         "description": "剔除空行、重复行和重复采集记录。",
@@ -206,9 +216,144 @@ PREPROCESS_METHOD_CARDS = [
 PREPROCESS_METHOD_BY_ID = {item["id"]: item for item in PREPROCESS_METHOD_CARDS}
 
 
+def load_preprocess_method_cards():
+    try:
+        response = requests.get(f"{api_base}/preprocess/methods", timeout=5)
+        if response.status_code == 200:
+            methods = response.json().get("methods", [])
+            normalized = []
+            for method in methods:
+                if not isinstance(method, dict) or not method.get("id"):
+                    continue
+                normalized.append(
+                    {
+                        "id": str(method.get("id")),
+                        "name": str(method.get("name") or method.get("id")),
+                        "description": str(method.get("description") or ""),
+                    }
+                )
+            if normalized:
+                return normalized
+    except Exception:
+        pass
+    return PREPROCESS_METHOD_CARDS
+
+
+def collect_preprocess_artifacts(report: dict):
+    artifacts = []
+
+    def visit(value, prefix, method_name):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                label = f"{prefix} / {key}" if prefix else str(key)
+                visit(item, label, method_name)
+            return
+        if isinstance(value, list):
+            for idx, item in enumerate(value, start=1):
+                visit(item, f"{prefix} {idx}", method_name)
+            return
+        if not isinstance(value, str):
+            return
+
+        text = value.strip()
+        suffix = Path(text).suffix.lower()
+        if not text or suffix not in {".csv", ".xlsx", ".xls", ".json", ".png", ".jpg", ".jpeg", ".txt", ".md"}:
+            return
+        artifacts.append(
+            {
+                "method": method_name,
+                "label": prefix or Path(text).name,
+                "path": text,
+                "name": Path(text).name,
+                "suffix": suffix.lstrip(".") or "file",
+            }
+        )
+
+    for stage in report.get("methodReports", []) or []:
+        if not isinstance(stage, dict):
+            continue
+        method_name = stage.get("name") or stage.get("method") or "预处理方法"
+        operations = stage.get("operations") or {}
+        if not isinstance(operations, dict):
+            continue
+        visit(operations.get("artifacts"), "产物", method_name)
+        visit(operations.get("originalProgramArtifacts"), "原程序产物", method_name)
+    return artifacts
+
+
+def render_artifact_preview(name: str, data: bytes, suffix: str):
+    suffix = suffix.lower().lstrip(".")
+    try:
+        if suffix == "csv":
+            df = pd.read_csv(io.BytesIO(data))
+            st.dataframe(df.head(300), use_container_width=True, height=260)
+            st.caption(f"预览 {min(len(df), 300)} / {len(df)} 行")
+        elif suffix in {"xlsx", "xls"}:
+            df = pd.read_excel(io.BytesIO(data))
+            st.dataframe(df.head(300), use_container_width=True, height=260)
+            st.caption(f"预览 {min(len(df), 300)} / {len(df)} 行")
+        elif suffix == "json":
+            st.json(json.loads(data.decode("utf-8-sig")))
+        elif suffix in {"png", "jpg", "jpeg"}:
+            st.image(data, caption=name, use_container_width=True)
+        elif suffix in {"txt", "md"}:
+            st.code(data.decode("utf-8-sig", errors="replace")[:12000])
+        else:
+            st.caption("该格式暂不支持在线预览，可直接下载。")
+    except Exception as exc:
+        st.caption(f"该产物暂不可预览: {exc}")
+
+
+def render_preprocess_artifacts(report: dict):
+    artifacts = collect_preprocess_artifacts(report)
+    if not artifacts:
+        return
+    job_id = report.get("jobId")
+    st.markdown("### 方法产物")
+    if not job_id:
+        st.caption("当前报告缺少 Job ID，暂不能下载方法产物。")
+        return
+
+    artifact_rows = [
+        {
+            "方法": item["method"],
+            "产物": item["label"],
+            "文件名": item["name"],
+            "格式": item["suffix"],
+        }
+        for item in artifacts
+    ]
+    st.dataframe(pd.DataFrame(artifact_rows), use_container_width=True, hide_index=True)
+
+    for idx, artifact in enumerate(artifacts):
+        title = f"{artifact['method']} · {artifact['label']} · {artifact['name']}"
+        with st.expander(title, expanded=False):
+            try:
+                response = requests.get(
+                    f"{api_base}/preprocess/workbench/artifact/download",
+                    params={"jobId": job_id, "path": artifact["path"]},
+                    timeout=120,
+                )
+                if response.status_code != 200:
+                    st.warning(f"产物读取失败: {response.text}")
+                    continue
+                data = response.content
+                render_artifact_preview(artifact["name"], data, artifact["suffix"])
+                st.download_button(
+                    "下载该产物",
+                    data=data,
+                    file_name=artifact["name"],
+                    mime=response.headers.get("content-type") or "application/octet-stream",
+                    use_container_width=True,
+                    key=f"preprocess_artifact_download_{idx}",
+                )
+            except Exception as exc:
+                st.error(f"产物读取失败: {exc}")
+
+
 PREPROCESS_METHOD_PRESETS = {
     "通用表格标准化": {
-        "description": "适合 CSV、Excel、JSON、JSONL 的通用清洗、去重和列名规范化。",
+        "description": "适合 CSV、Excel、JSON、JSONL、LAS 的通用清洗、去重和列名规范化。",
         "config": {
             "standardVersion": "1.0",
             "datasetType": "generic_tabular",
@@ -488,6 +633,18 @@ def render_preprocess_result(report: dict):
         if saved.get("indexRebuilt"):
             st.caption(f"已同步构建索引，共 {saved.get('indexedChunks', 0)} 个文本块。")
 
+    excel_output_path = report.get("excelOutputPath")
+    if excel_output_path and Path(str(excel_output_path)).exists():
+        st.download_button(
+            "下载 Excel 结果",
+            data=Path(str(excel_output_path)).read_bytes(),
+            file_name=f"{Path(report.get('sourceFileName') or 'preprocessed').stem}_preprocessed.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    render_preprocess_artifacts(report)
+
     with st.expander("查看完整审计报告", expanded=False):
         st.json(report)
 
@@ -516,7 +673,7 @@ def render_preprocess_result(report: dict):
 
 
 def render_data_preprocess_workspace():
-    st.caption("上传结构化文件，按顺序选择多个预处理方法，统一开始处理后再按需保存到知识库。")
+    st.caption("上传结构化文件，按顺序选择多个预处理方法，统一开始处理后再按需保存到知识库。支持 LAS 测井数据转 Excel。")
     st.markdown(
         """
         <style>
@@ -579,15 +736,22 @@ def render_data_preprocess_workspace():
     )
 
     st.markdown("### 1. 上传文件")
-    uploaded_file = st.file_uploader(
-        "选择一个结构化文件",
-        type=["csv", "xlsx", "xls", "json", "jsonl"],
-        accept_multiple_files=False,
+    uploaded_files = st.file_uploader(
+        "选择结构化文件",
+        type=["csv", "xlsx", "xls", "json", "jsonl", "las"],
+        accept_multiple_files=True,
         key="standalone_preprocess_uploader",
     )
+    uploaded_files = uploaded_files or []
 
     if "preprocess_job" not in st.session_state:
         st.session_state.preprocess_job = None
+    if "preprocess_jobs" not in st.session_state:
+        st.session_state.preprocess_jobs = []
+    if "preprocess_reports_by_job" not in st.session_state:
+        st.session_state.preprocess_reports_by_job = {}
+    if "preprocess_uploaded_file_keys" not in st.session_state:
+        st.session_state.preprocess_uploaded_file_keys = set()
     if "preprocess_selected_methods" not in st.session_state:
         st.session_state.preprocess_selected_methods = []
     if "preprocess_last_report" not in st.session_state:
@@ -597,38 +761,80 @@ def render_data_preprocess_workspace():
     with upload_col:
         upload_clicked = st.button(
             "上传到预处理工作台",
-            disabled=uploaded_file is None,
+            disabled=not uploaded_files,
             type="primary",
             use_container_width=True,
             key="standalone_preprocess_upload_btn",
         )
     with upload_info_col:
-        if st.session_state.preprocess_job:
-            job = st.session_state.preprocess_job
-            st.success(f"已上传: {job.get('fileName')}  ·  Job: `{job.get('jobId')}`")
-        elif uploaded_file is not None:
-            st.caption(f"待上传文件: {uploaded_file.name}")
+        if uploaded_files:
+            st.caption(f"待上传 {len(uploaded_files)} 个文件: " + "、".join(file.name for file in uploaded_files[:4]))
+        if st.session_state.preprocess_jobs:
+            st.success(f"工作台已有 {len(st.session_state.preprocess_jobs)} 个文件")
 
-    if upload_clicked and uploaded_file is not None:
-        try:
-            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/octet-stream")}
-            r_upload = requests.post(f"{api_base}/preprocess/upload", files=files, timeout=180)
-            if r_upload.status_code == 200:
-                st.session_state.preprocess_job = r_upload.json()
-                st.session_state.preprocess_last_report = None
-                st.success("文件已上传到预处理工作台")
-            else:
-                st.error(f"上传失败: {r_upload.text}")
-        except Exception as exc:
-            st.error(f"上传请求失败: {exc}")
+    if upload_clicked and uploaded_files:
+        uploaded_count = 0
+        skipped_count = 0
+        for file_item in uploaded_files:
+            file_bytes = file_item.getvalue()
+            file_key = f"{file_item.name}:{len(file_bytes)}"
+            if file_key in st.session_state.preprocess_uploaded_file_keys:
+                skipped_count += 1
+                continue
+            try:
+                files = {"file": (file_item.name, file_bytes, "application/octet-stream")}
+                r_upload = requests.post(f"{api_base}/preprocess/upload", files=files, timeout=180)
+                if r_upload.status_code == 200:
+                    job = r_upload.json()
+                    st.session_state.preprocess_jobs.append(job)
+                    st.session_state.preprocess_job = job
+                    st.session_state.preprocess_last_report = st.session_state.preprocess_reports_by_job.get(job.get("jobId"))
+                    st.session_state.preprocess_uploaded_file_keys.add(file_key)
+                    uploaded_count += 1
+                else:
+                    st.error(f"{file_item.name} 上传失败: {r_upload.text}")
+            except Exception as exc:
+                st.error(f"{file_item.name} 上传请求失败: {exc}")
+        if uploaded_count:
+            st.success(f"已上传 {uploaded_count} 个文件到预处理工作台")
+        if skipped_count:
+            st.caption(f"已跳过 {skipped_count} 个本次会话中已上传的同名同大小文件。")
+        if uploaded_count:
+            st.rerun()
+
+    if st.session_state.preprocess_jobs:
+        job_options = [job.get("jobId") for job in st.session_state.preprocess_jobs if job.get("jobId")]
+        current_job_id = (st.session_state.preprocess_job or {}).get("jobId")
+        default_index = job_options.index(current_job_id) if current_job_id in job_options else len(job_options) - 1
+        selected_job_id = st.selectbox(
+            "当前处理文件",
+            options=job_options,
+            index=max(default_index, 0),
+            format_func=lambda jid: next(
+                (
+                    f"{job.get('fileName')} · {jid}"
+                    for job in st.session_state.preprocess_jobs
+                    if job.get("jobId") == jid
+                ),
+                jid,
+            ),
+            key="preprocess_current_job_select",
+        )
+        selected_job = next((job for job in st.session_state.preprocess_jobs if job.get("jobId") == selected_job_id), None)
+        if selected_job and selected_job.get("jobId") != current_job_id:
+            st.session_state.preprocess_job = selected_job
+            st.session_state.preprocess_last_report = st.session_state.preprocess_reports_by_job.get(selected_job_id)
+            st.rerun()
 
     st.markdown("### 2. 选择预处理方法")
+    preprocess_method_cards = load_preprocess_method_cards()
+    preprocess_method_by_id = {item["id"]: item for item in preprocess_method_cards}
     selected_methods = st.session_state.preprocess_selected_methods
-    remaining_methods = [m for m in PREPROCESS_METHOD_CARDS if m["id"] not in selected_methods]
+    remaining_methods = [m for m in preprocess_method_cards if m["id"] not in selected_methods]
 
     method_cards = []
     for idx, method_id in enumerate(selected_methods):
-        method = PREPROCESS_METHOD_BY_ID.get(method_id, {"name": method_id, "description": ""})
+        method = preprocess_method_by_id.get(method_id, {"name": method_id, "description": ""})
         method_cards.append(
             f"""
             <div class="preprocess-method-card">
@@ -658,7 +864,7 @@ def render_data_preprocess_workspace():
             add_choice = st.selectbox(
                 "添加方法",
                 options=[""] + [m["id"] for m in remaining_methods],
-                format_func=lambda mid: "⊕" if not mid else PREPROCESS_METHOD_BY_ID[mid]["name"],
+                format_func=lambda mid: "⊕" if not mid else preprocess_method_by_id[mid]["name"],
                 key="fallback_add_preprocess_method",
             )
             if add_choice:
@@ -671,7 +877,7 @@ def render_data_preprocess_workspace():
             remove_choice = st.selectbox(
                 "移除已选方法",
                 options=[""] + selected_methods,
-                format_func=lambda mid: "请选择" if not mid else PREPROCESS_METHOD_BY_ID.get(mid, {"name": mid})["name"],
+                format_func=lambda mid: "请选择" if not mid else preprocess_method_by_id.get(mid, {"name": mid})["name"],
                 key="preprocess_remove_choice",
             )
             if st.button("移除所选方法", disabled=not remove_choice, use_container_width=True, key="preprocess_remove_selected"):
@@ -683,7 +889,7 @@ def render_data_preprocess_workspace():
     if st.button("开始预处理", type="primary", use_container_width=True, disabled=not can_run, key="standalone_preprocess_run"):
         progress_placeholders = {}
         for method_id in st.session_state.preprocess_selected_methods:
-            method = PREPROCESS_METHOD_BY_ID.get(method_id, {"name": method_id})
+            method = preprocess_method_by_id.get(method_id, {"name": method_id})
             progress_placeholders[method_id] = st.progress(0, text=f"{method['name']} 等待处理")
 
         try:
@@ -696,9 +902,11 @@ def render_data_preprocess_workspace():
             if r_run.status_code == 200:
                 report = r_run.json()
                 st.session_state.preprocess_last_report = report
+                if report.get("jobId"):
+                    st.session_state.preprocess_reports_by_job[report["jobId"]] = report
                 for stage in report.get("methodReports", []):
                     method_id = stage.get("method")
-                    method = PREPROCESS_METHOD_BY_ID.get(method_id, {"name": stage.get("name", method_id)})
+                    method = preprocess_method_by_id.get(method_id, {"name": stage.get("name", method_id)})
                     if method_id in progress_placeholders:
                         progress_placeholders[method_id].progress(
                             int(stage.get("progress", 100)),
@@ -707,7 +915,7 @@ def render_data_preprocess_workspace():
                 st.success("预处理完成")
             else:
                 for method_id, placeholder in progress_placeholders.items():
-                    method = PREPROCESS_METHOD_BY_ID.get(method_id, {"name": method_id})
+                    method = preprocess_method_by_id.get(method_id, {"name": method_id})
                     placeholder.progress(0, text=f"{method['name']} 未完成")
                 st.error(f"预处理失败: {r_run.text}")
         except Exception as exc:
@@ -767,6 +975,10 @@ def render_data_preprocess_workspace():
             if r_store.status_code == 200:
                 saved_info = r_store.json()
                 st.session_state.preprocess_last_report["savedToKb"] = saved_info
+                if st.session_state.preprocess_last_report.get("jobId"):
+                    st.session_state.preprocess_reports_by_job[
+                        st.session_state.preprocess_last_report["jobId"]
+                    ] = st.session_state.preprocess_last_report
                 st.success(f"已保存到知识库 `{saved_info.get('kbId')}`，文件 ID: `{saved_info.get('fileId')}`")
             else:
                 st.error(f"保存失败: {r_store.text}")
@@ -1229,8 +1441,8 @@ with tab6:
         # === 上传区域 ===
         with st.expander("📤 上传文件到当前知识库", expanded=True):
             uploaded_files = st.file_uploader(
-                "选择多个文件 (支持 PDF, Word, Excel, CSV)", 
-                type=["pdf", "docx", "doc", "xlsx", "xls", "csv"],
+                "选择多个文件 (支持 PDF, Word, Excel, CSV, 图片)",
+                type=["pdf", "docx", "doc", "xlsx", "xls", "csv", "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
                 accept_multiple_files=True,
                 key="uploader_tab5"
             )
@@ -1306,6 +1518,12 @@ with tab6:
                             elif up_file.name.endswith(".doc"): mime_type = "application/msword"
                             elif up_file.name.endswith(".xlsx"): mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             elif up_file.name.endswith(".csv"): mime_type = "text/csv"
+                            elif up_file.name.lower().endswith((".jpg", ".jpeg")): mime_type = "image/jpeg"
+                            elif up_file.name.lower().endswith(".png"): mime_type = "image/png"
+                            elif up_file.name.lower().endswith(".webp"): mime_type = "image/webp"
+                            elif up_file.name.lower().endswith(".bmp"): mime_type = "image/bmp"
+                            elif up_file.name.lower().endswith(".gif"): mime_type = "image/gif"
+                            elif up_file.name.lower().endswith((".tif", ".tiff")): mime_type = "image/tiff"
                             
                             files = {"file": (up_file.name, up_file, mime_type)}
                             resp = requests.post(
@@ -1378,8 +1596,7 @@ with tab6:
                                 st.markdown("**📊 实时解析进度**")
                                 table_placeholder = st.empty()
                                 
-                                # 最大轮询时间 (例如 5 分钟)
-                                max_retries = 300 
+                                max_retries = PARSE_MONITOR_MAX_RETRIES
                                 for _ in range(max_retries):
                                     all_done = True
                                     
@@ -1391,7 +1608,7 @@ with tab6:
                                             
                                         all_done = False
                                         try:
-                                            r = requests.get(f"{api_base}/pdf/status", params={"kbId": current_kb, "fileId": task["fid"]}, timeout=1)
+                                            r = requests.get(f"{api_base}/pdf/status", params={"kbId": current_kb, "fileId": task["fid"]}, timeout=PARSE_STATUS_TIMEOUT)
                                             if r.status_code == 200:
                                                 d = r.json()
                                                 # 使用 0-100 的整数进度，避免小数格式化问题
@@ -1428,7 +1645,7 @@ with tab6:
                                     
                                     time.sleep(1.5)
                                 else:
-                                    st.warning("⚠️ 监控超时，请稍后在文件列表中查看最终状态。")
+                                    st.warning("⚠️ 等待窗口已结束，后台可能仍在继续解析，请稍后在文件列表中查看最终状态。")
 
                     with col_b2:
                         # 索引一般需要解析完成后进行，但这里允许用户批量触发
@@ -1618,7 +1835,7 @@ with tab6:
                                 st.markdown("**📊 重新解析进度**")
                                 table_placeholder = st.empty()
                                 
-                                max_retries = 300 
+                                max_retries = PARSE_MONITOR_MAX_RETRIES
                                 for _ in range(max_retries):
                                     all_done = True
                                     for task in active_tasks:
@@ -1627,7 +1844,7 @@ with tab6:
                                             
                                         all_done = False
                                         try:
-                                            r = requests.get(f"{api_base}/pdf/status", params={"kbId": current_kb, "fileId": task["fid"]}, timeout=1)
+                                            r = requests.get(f"{api_base}/pdf/status", params={"kbId": current_kb, "fileId": task["fid"]}, timeout=PARSE_STATUS_TIMEOUT)
                                             if r.status_code == 200:
                                                 d = r.json()
                                                 task["progress"] = d.get("progress", 0) 
@@ -1660,7 +1877,7 @@ with tab6:
                                     
                                     time.sleep(1.5)
                                 else:
-                                    st.warning("⚠️ 监控超时，请查看最终文件状态。")
+                                    st.warning("⚠️ 等待窗口已结束，后台可能仍在继续解析，请稍后查看最终文件状态。")
                             
                             time.sleep(1)
                             st.rerun()
@@ -2288,7 +2505,10 @@ with tab5:
 
     with col_ex_1:
         st.subheader("1. 文件与配置")
-        uploaded_file = st.file_uploader("上传待提取的文件 (PDF, Word, Excel, CSV, TXT)", type=["pdf", "docx", "xlsx", "csv", "txt", "md"])
+        uploaded_file = st.file_uploader(
+            "上传待提取的文件 (PDF, Word, Excel, CSV, TXT, 图片)",
+            type=["pdf", "docx", "xlsx", "csv", "txt", "md", "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+        )
         
         # --- 预置模板逻辑 ---
         PRESET_TEMPLATES = {

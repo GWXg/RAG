@@ -40,7 +40,7 @@ def clear_history(session_id: str) -> None:
 
 # ---------------- 配置 ----------------
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-MODEL_NAME = "qwen2.5:32b"
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5:7b")
 TEMPERATURE = 0
 
 EMBED_MODEL = "bge-m3:latest"  # default; may be overridden per KB by meta.json

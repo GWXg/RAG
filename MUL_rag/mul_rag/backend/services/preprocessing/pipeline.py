@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import time
 from copy import deepcopy
-from difflib import get_close_matches
+from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -25,45 +26,99 @@ DEFAULT_PREPROCESS_CONFIG: Dict[str, Any] = {
     "columnSpecs": {},
 }
 
-PREPROCESS_METHODS: List[Dict[str, str]] = [
+PREPROCESS_METHODS: List[Dict[str, Any]] = [
     {
         "id": "format_standardize",
         "name": "格式标准化",
         "description": "统一表头、空值标记、空白字符和基础类型。",
+        "defaultAlgorithm": "regex_rules",
+        "algorithms": [
+            {"id": "regex_rules", "name": "正则表达式", "description": "按现有规则统一表头、空白、空值与基础类型。"},
+            {"id": "header_mapping", "name": "表头映射与字段归一", "description": "清理并映射字段名称，保留原始数据类型。"},
+            {"id": "datetime_normalize", "name": "时间格式统一", "description": "识别日期时间字段并统一为标准时间类型。"},
+        ],
+    },
+    {
+        "id": "las_to_excel",
+        "name": "测井曲线转表格",
+        "description": "解析测井曲线、井信息和空值标记，并输出标准表格文件。",
+        "defaultAlgorithm": "lasio_parse",
+        "algorithms": [
+            {"id": "lasio_parse", "name": "LAS 读写解析", "description": "解析 LAS 井信息、曲线和空值标记。"},
+            {"id": "welly_align", "name": "曲线管理与深度对齐", "description": "按深度索引对齐多条测井曲线。"},
+            {"id": "depth_resample", "name": "深度等距重采样", "description": "按统一深度间隔重采样曲线数据。"},
+        ],
     },
     {
         "id": "dedupe",
         "name": "冗余数据剔除",
         "description": "剔除空行和重复记录，减少重复入库内容。",
+        "defaultAlgorithm": "exact_duplicate",
+        "algorithms": [
+            {"id": "exact_duplicate", "name": "完全重复删除", "description": "删除完全一致的重复记录和空行。"},
+            {"id": "minhash_approx", "name": "MinHash 近似去重", "description": "按文本分片签名识别近似重复记录。"},
+            {"id": "record_linkage", "name": "记录链接去重", "description": "按归一化记录相似度合并重复项。"},
+        ],
     },
     {
         "id": "missing_fill",
         "name": "缺失补全",
         "description": "按列类型使用中位数、众数或空串补全缺失值。",
+        "defaultAlgorithm": "statistical_fill",
+        "algorithms": [
+            {"id": "statistical_fill", "name": "统计量填充", "description": "数值列用中位数，文本列用众数补全。"},
+            {"id": "linear_interpolation", "name": "线性插值", "description": "按记录顺序对数值缺口执行线性插值。"},
+            {"id": "knn_imputation", "name": "KNN 插补", "description": "利用相似样本的邻域信息补全数值缺失。"},
+        ],
     },
     {
         "id": "anomaly_correct",
         "name": "异常纠错",
         "description": "对数值列按 IQR 范围自动裁剪异常值。",
+        "defaultAlgorithm": "iqr",
+        "algorithms": [
+            {"id": "iqr", "name": "箱线图 IQR", "description": "按四分位距识别并裁剪异常值。"},
+            {"id": "three_sigma", "name": "3σ 拉依达法则", "description": "按均值正负三倍标准差识别异常值。"},
+            {"id": "mad", "name": "MAD 中位数绝对偏差", "description": "使用稳健统计量识别尖峰和离群点。"},
+        ],
     },
     {
         "id": "unit_dimension_check",
         "name": "单位统一与量纲校验",
         "description": "识别井深、钻压、扭矩、流量、温度、压力等字段的常见单位并统一量纲。",
+        "defaultAlgorithm": "combined_unit_rules",
+        "algorithms": [
+            {"id": "combined_unit_rules", "name": "组合单位规则", "description": "综合列名、单位列和值内单位完成换算。"},
+            {"id": "label_unit_mapping", "name": "表头单位映射", "description": "根据字段名中的单位标记执行换算。"},
+            {"id": "cell_unit_parsing", "name": "单元格单位解析", "description": "解析数值后的单位文本并统一量纲。"},
+        ],
     },
     {
         "id": "engineering_constraint_check",
         "name": "工程范围/物理约束校验",
         "description": "校验钻压、转速、泵压、井深、流量、温度、钩载等字段的工程合理范围。",
+        "defaultAlgorithm": "boundary_clip",
+        "algorithms": [
+            {"id": "boundary_clip", "name": "工程边界裁剪", "description": "将越界值裁剪到工程允许范围。"},
+            {"id": "invalid_to_missing", "name": "越界值置空", "description": "将违反工程约束的数值标记为缺失。"},
+            {"id": "constraint_flag", "name": "物理约束标记", "description": "保留原值并新增约束校验结果列。"},
+        ],
     },
     {
         "id": "schema_standardize",
         "name": "维度标准统一",
         "description": "统一列名格式并补齐多表之间的字段维度。",
+        "defaultAlgorithm": "schema_mapping",
+        "algorithms": [
+            {"id": "schema_mapping", "name": "字段维度统一", "description": "统一字段命名与输出结构。"},
+            {"id": "min_max", "name": "Min-Max 归一化", "description": "将数值字段缩放到 0 到 1 区间。"},
+            {"id": "z_score", "name": "Z-Score 标准化", "description": "按均值和标准差标准化数值字段。"},
+        ],
     },
 ]
 
 METHOD_NAME_BY_ID = {item["id"]: item["name"] for item in PREPROCESS_METHODS}
+METHOD_BY_ID = {item["id"]: item for item in PREPROCESS_METHODS}
 
 
 def get_preprocessed_output(kb_id: str, file_id: str) -> Path:
@@ -130,6 +185,7 @@ def run_selected_preprocess_methods(
     file_path: str | Path,
     output_dir: str | Path,
     methods: List[str],
+    algorithm_selections: Optional[Dict[str, str]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a visible, ordered preprocessing pipeline selected by the user."""
@@ -145,6 +201,8 @@ def run_selected_preprocess_methods(
 
     report = _new_report(source, cfg)
     report["selectedMethods"] = selected_methods
+    selected_algorithms = _normalize_algorithm_selections(selected_methods, algorithm_selections or {})
+    report["algorithmSelections"] = selected_algorithms
     report["methodReports"] = []
 
     frames = _read_tables(source, cfg, report)
@@ -163,15 +221,19 @@ def run_selected_preprocess_methods(
     report["columnsIn"] = sorted({col for _, frame in frames for col in map(str, frame.columns)})
 
     for method in selected_methods:
+        algorithm_id = selected_algorithms[method]
+        algorithm_name = _algorithm_name(method, algorithm_id)
         before_rows = len(combined)
         before_cols = list(combined.columns)
         before_missing = int(combined.isna().sum().sum()) if not combined.empty else 0
-        combined, method_ops = _apply_selected_method(combined, method, cfg, report)
+        combined, method_ops = _apply_selected_method(combined, method, algorithm_id, cfg, report)
         after_missing = int(combined.isna().sum().sum()) if not combined.empty else 0
         report["methodReports"].append(
             {
                 "method": method,
                 "name": METHOD_NAME_BY_ID.get(method, method),
+                "algorithm": algorithm_id,
+                "algorithmName": algorithm_name,
                 "status": "done",
                 "progress": 100,
                 "rowsIn": int(before_rows),
@@ -245,15 +307,48 @@ def _dedupe_methods(methods: Iterable[str]) -> List[str]:
     return selected
 
 
+def _normalize_algorithm_selections(methods: Iterable[str], selections: Dict[str, str]) -> Dict[str, str]:
+    normalized: Dict[str, str] = {}
+    for method_id in methods:
+        method = METHOD_BY_ID[method_id]
+        algorithm_ids = {str(item["id"]) for item in method.get("algorithms", [])}
+        requested = str(selections.get(method_id) or "").strip()
+        default_algorithm = str(method.get("defaultAlgorithm") or "").strip()
+        if requested in algorithm_ids:
+            normalized[method_id] = requested
+        elif default_algorithm in algorithm_ids:
+            normalized[method_id] = default_algorithm
+        elif algorithm_ids:
+            normalized[method_id] = str(method["algorithms"][0]["id"])
+        else:
+            normalized[method_id] = "default"
+    return normalized
+
+
+def _algorithm_name(method_id: str, algorithm_id: str) -> str:
+    method = METHOD_BY_ID.get(method_id, {})
+    for algorithm in method.get("algorithms", []):
+        if str(algorithm.get("id")) == algorithm_id:
+            return str(algorithm.get("name") or algorithm_id)
+    return algorithm_id
+
+
 def _apply_selected_method(
     df: pd.DataFrame,
     method: str,
+    algorithm: str,
     config: Dict[str, Any],
     report: Dict[str, Any],
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if method == "format_standardize":
-        return _method_format_standardize(df, config)
+        return _method_format_standardize(df, config, algorithm)
+    if method == "las_to_excel":
+        return _method_las_to_excel(df, report, algorithm)
     if method == "dedupe":
+        if algorithm == "minhash_approx":
+            return _method_minhash_dedupe(df, report)
+        if algorithm == "record_linkage":
+            return _method_record_linkage_dedupe(df, report)
         before_empty = report["operations"].get("emptyRowsRemoved", 0)
         before_dup = report["operations"].get("duplicateRowsRemoved", 0)
         out = _drop_empty_rows(df, report)
@@ -263,20 +358,24 @@ def _apply_selected_method(
             "duplicateRowsRemoved": report["operations"].get("duplicateRowsRemoved", 0) - before_dup,
         }
     if method == "missing_fill":
-        return _method_auto_fill_missing(df, report)
+        return _method_fill_missing(df, report, algorithm)
     if method == "anomaly_correct":
-        return _method_auto_correct_anomalies(df, report)
+        return _method_auto_correct_anomalies(df, report, algorithm)
     if method == "unit_dimension_check":
-        return _method_unit_dimension_check(df, report)
+        return _method_unit_dimension_check(df, report, algorithm)
     if method == "engineering_constraint_check":
-        return _method_engineering_constraint_check(df, report)
+        return _method_engineering_constraint_check(df, report, algorithm)
     if method == "schema_standardize":
-        return _method_schema_standardize(df, report)
+        return _method_schema_standardize(df, report, algorithm)
     report["warnings"].append(f"Unknown preprocessing method ignored: {method}")
     return df, {}
 
 
-def _method_format_standardize(df: pd.DataFrame, config: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _method_format_standardize(
+    df: pd.DataFrame,
+    config: Dict[str, Any],
+    algorithm: str = "regex_rules",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = df.copy()
     renamed: Dict[str, str] = {}
     cleaned_columns = []
@@ -289,25 +388,182 @@ def _method_format_standardize(df: pd.DataFrame, config: Dict[str, Any]) -> Tupl
     out = _normalize_missing_values(out, config)
     out = _normalize_text_cells(out, config)
 
+    if algorithm == "header_mapping":
+        return out, {"columnsRenamed": renamed, "mappingMode": "header"}
+
     converted: Dict[str, str] = {}
     for col in out.columns:
         if str(col).startswith("_source_"):
             continue
         normalized = _normalize_label(col)
         series = out[col]
-        if any(token in normalized for token in ("time", "date", "日期", "时间")):
+        is_datetime = any(token in normalized for token in ("time", "date", "日期", "时间"))
+        if is_datetime:
             parsed = pd.to_datetime(series, errors="coerce")
             if parsed.notna().sum() >= max(1, int(series.notna().sum() * 0.6)):
                 out[col] = parsed
                 converted[str(col)] = "datetime"
             continue
-        if series.dtype == object or str(series.dtype).startswith("string"):
+        if algorithm != "datetime_normalize" and (series.dtype == object or str(series.dtype).startswith("string")):
             numeric = _to_numeric(series)
             if numeric.notna().sum() >= max(1, int(series.notna().sum() * 0.8)):
                 out[col] = numeric
                 converted[str(col)] = "number"
 
     return out, {"columnsRenamed": renamed, "typesInferred": converted}
+
+
+def _method_las_to_excel(
+    df: pd.DataFrame,
+    report: Dict[str, Any],
+    algorithm: str = "lasio_parse",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Finalize an already parsed LAS table using the selected curve strategy."""
+    out = df.copy()
+    if out.empty:
+        return out, {"lasStrategy": algorithm, "curveCount": 0}
+
+    depth_column = next(
+        (column for column in out.columns if str(column).strip().lower() in {"dept", "depth", "深度", "md"}),
+        out.columns[0],
+    )
+    out[depth_column] = pd.to_numeric(out[depth_column], errors="coerce")
+    out = out.dropna(subset=[depth_column]).sort_values(depth_column).drop_duplicates(subset=[depth_column], keep="first")
+
+    if algorithm == "depth_resample" and len(out) > 1:
+        depth = out[depth_column].astype(float)
+        intervals = depth.diff().dropna()
+        interval = float(intervals[intervals > 0].median()) if (intervals > 0).any() else 0.0
+        if interval > 0:
+            sample_count = int((depth.iloc[-1] - depth.iloc[0]) / interval) + 1
+            grid = pd.Index([depth.iloc[0] + index * interval for index in range(sample_count)], name=depth_column)
+            indexed = out.set_index(depth_column)
+            out = indexed.reindex(indexed.index.union(grid)).sort_index()
+            numeric_columns = out.select_dtypes(include="number").columns
+            out.loc[:, numeric_columns] = out.loc[:, numeric_columns].interpolate(method="index", limit_direction="both")
+            out = out.loc[grid].reset_index()
+            return out, {
+                "lasStrategy": algorithm,
+                "depthColumn": str(depth_column),
+                "depthInterval": interval,
+                "curveCount": max(0, len(out.columns) - 1),
+            }
+
+    if algorithm == "welly_align":
+        curve_columns = [column for column in out.columns if column != depth_column]
+        for column in curve_columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+        return out.reset_index(drop=True), {
+            "lasStrategy": algorithm,
+            "depthColumn": str(depth_column),
+            "aligned": True,
+            "curveCount": len(curve_columns),
+        }
+
+    return out.reset_index(drop=True), {
+        "lasStrategy": algorithm,
+        "depthColumn": str(depth_column),
+        "curveCount": max(0, len(out.columns) - 1),
+    }
+
+
+def _row_similarity_tokens(row: pd.Series) -> set[str]:
+    values = []
+    for column, value in row.items():
+        if str(column).startswith("_source_") or pd.isna(value):
+            continue
+        normalized = re.sub(r"\s+", " ", str(value).strip().lower())
+        if normalized:
+            values.append(normalized)
+    text = "|".join(values)
+    if not text:
+        return set()
+    if len(text) < 3:
+        return {text}
+    return {text[index : index + 3] for index in range(len(text) - 2)}
+
+
+def _minhash_signature(tokens: set[str], size: int = 12) -> Tuple[int, ...]:
+    if not tokens:
+        return tuple()
+    signature = []
+    for seed in range(size):
+        minimum = min(
+            int.from_bytes(hashlib.blake2b(f"{seed}:{token}".encode("utf-8"), digest_size=8).digest(), "big")
+            for token in tokens
+        )
+        signature.append(minimum)
+    return tuple(signature)
+
+
+def _record_removed_duplicates(report: Dict[str, Any], count: int) -> None:
+    if count:
+        report["operations"]["duplicateRowsRemoved"] = report["operations"].get("duplicateRowsRemoved", 0) + count
+
+
+def _method_minhash_dedupe(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    out = _drop_empty_rows(df, report)
+    token_sets: List[set[str]] = []
+    kept_indices: List[Any] = []
+    buckets: Dict[Tuple[int, Tuple[int, ...]], List[int]] = {}
+    removed = 0
+
+    for row_index, (_, row) in enumerate(out.iterrows()):
+        tokens = _row_similarity_tokens(row)
+        signature = _minhash_signature(tokens)
+        candidate_positions: set[int] = set()
+        for band in range(4):
+            band_value = signature[band * 3 : (band + 1) * 3]
+            candidate_positions.update(buckets.get((band, band_value), []))
+        is_duplicate = False
+        for position in candidate_positions:
+            other = token_sets[position]
+            union = tokens | other
+            similarity = len(tokens & other) / len(union) if union else 1.0
+            if similarity >= 0.88:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            removed += 1
+            continue
+        position = len(token_sets)
+        token_sets.append(tokens)
+        kept_indices.append(out.index[row_index])
+        for band in range(4):
+            band_value = signature[band * 3 : (band + 1) * 3]
+            buckets.setdefault((band, band_value), []).append(position)
+
+    _record_removed_duplicates(report, removed)
+    return out.loc[kept_indices].reset_index(drop=True), {"duplicateRowsRemoved": removed, "similarityThreshold": 0.88}
+
+
+def _method_record_linkage_dedupe(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    out = _drop_empty_rows(df, report)
+    kept_indices: List[Any] = []
+    kept_records: List[str] = []
+    removed = 0
+    for row_index, (_, row) in enumerate(out.iterrows()):
+        record = "|".join(sorted(_row_similarity_tokens(row)))
+        recent_records = kept_records[-250:]
+        if any(SequenceMatcher(None, record, candidate).ratio() >= 0.94 for candidate in recent_records):
+            removed += 1
+            continue
+        kept_indices.append(out.index[row_index])
+        kept_records.append(record)
+    _record_removed_duplicates(report, removed)
+    return out.loc[kept_indices].reset_index(drop=True), {"duplicateRowsRemoved": removed, "similarityThreshold": 0.94}
+
+
+def _method_fill_missing(
+    df: pd.DataFrame,
+    report: Dict[str, Any],
+    algorithm: str = "statistical_fill",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if algorithm == "linear_interpolation":
+        return _method_linear_interpolation(df, report)
+    if algorithm == "knn_imputation":
+        return _method_knn_imputation(df, report)
+    return _method_auto_fill_missing(df, report)
 
 
 def _method_auto_fill_missing(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -333,7 +589,83 @@ def _method_auto_fill_missing(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple
     return out, {"missingFilled": filled_by_col}
 
 
-def _method_auto_correct_anomalies(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _record_missing_fills(before: pd.Series, out: pd.DataFrame, report: Dict[str, Any]) -> Dict[str, int]:
+    filled_by_col: Dict[str, int] = {}
+    for col in out.columns:
+        before_count = int(before.get(col, 0))
+        filled = before_count - int(out[col].isna().sum())
+        if filled:
+            filled_by_col[str(col)] = filled
+            report["operations"]["missingFilled"][str(col)] = report["operations"]["missingFilled"].get(str(col), 0) + filled
+    return filled_by_col
+
+
+def _fill_text_columns(out: pd.DataFrame) -> None:
+    for col in out.columns:
+        if str(col).startswith("_source_") or pd.api.types.is_numeric_dtype(out[col]):
+            continue
+        mode = out[col].mode(dropna=True)
+        fill_value = mode.iloc[0] if not mode.empty else ""
+        out[col] = out[col].ffill().bfill().fillna(fill_value)
+
+
+def _method_linear_interpolation(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    out = df.copy()
+    before = out.isna().sum()
+    for col in out.columns:
+        if str(col).startswith("_source_") or not pd.api.types.is_numeric_dtype(out[col]):
+            continue
+        out[col] = out[col].interpolate(method="linear", limit_direction="both")
+    _fill_text_columns(out)
+    return out, {"missingFilled": _record_missing_fills(before, out, report), "interpolation": "linear"}
+
+
+def _method_knn_imputation(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    out = df.copy()
+    before = out.isna().sum()
+    numeric_columns = [
+        col
+        for col in out.columns
+        if not str(col).startswith("_source_") and pd.api.types.is_numeric_dtype(out[col]) and out[col].notna().any()
+    ]
+    if numeric_columns and len(out):
+        numeric = out[numeric_columns].apply(pd.to_numeric, errors="coerce")
+        means = numeric.mean()
+        scales = numeric.std(ddof=0).replace(0, 1).fillna(1)
+        standardized = (numeric - means) / scales
+        neighbors = max(1, min(5, len(out)))
+        for col in numeric_columns:
+            missing_indices = numeric.index[numeric[col].isna()]
+            candidate_indices = numeric.index[numeric[col].notna()]
+            feature_columns = [feature for feature in numeric_columns if feature != col]
+            for row_index in missing_indices:
+                usable_features = [feature for feature in feature_columns if pd.notna(standardized.at[row_index, feature])]
+                distances = pd.Series(dtype="float64")
+                if usable_features and len(candidate_indices):
+                    limited_candidates = candidate_indices[:5000]
+                    differences = standardized.loc[limited_candidates, usable_features].sub(
+                        standardized.loc[row_index, usable_features]
+                    )
+                    distances = differences.pow(2).mean(axis=1).dropna()
+                if not distances.empty:
+                    nearest_indices = distances.nsmallest(neighbors).index
+                    value = numeric.loc[nearest_indices, col].mean()
+                else:
+                    value = numeric[col].median()
+                numeric.at[row_index, col] = value if pd.notna(value) else 0
+            out[col] = numeric[col]
+    _fill_text_columns(out)
+    return out, {
+        "missingFilled": _record_missing_fills(before, out, report),
+        "neighbors": max(1, min(5, len(out))) if len(out) else 0,
+    }
+
+
+def _method_auto_correct_anomalies(
+    df: pd.DataFrame,
+    report: Dict[str, Any],
+    algorithm: str = "iqr",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = df.copy()
     corrected_by_col: Dict[str, int] = {}
     for col in out.columns:
@@ -343,13 +675,29 @@ def _method_auto_correct_anomalies(df: pd.DataFrame, report: Dict[str, Any]) -> 
         non_null = series.dropna()
         if len(non_null) < 4:
             continue
-        q1 = non_null.quantile(0.25)
-        q3 = non_null.quantile(0.75)
-        iqr = q3 - q1
-        if pd.isna(iqr) or iqr == 0:
-            continue
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
+        if algorithm == "three_sigma":
+            center = non_null.mean()
+            spread = non_null.std(ddof=0)
+            if pd.isna(spread) or spread == 0:
+                continue
+            lower = center - 3 * spread
+            upper = center + 3 * spread
+        elif algorithm == "mad":
+            center = non_null.median()
+            mad = (non_null - center).abs().median()
+            if pd.isna(mad) or mad == 0:
+                continue
+            robust_sigma = 1.4826 * mad
+            lower = center - 3.5 * robust_sigma
+            upper = center + 3.5 * robust_sigma
+        else:
+            q1 = non_null.quantile(0.25)
+            q3 = non_null.quantile(0.75)
+            iqr = q3 - q1
+            if pd.isna(iqr) or iqr == 0:
+                continue
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
         mask = ((series < lower) | (series > upper)).fillna(False)
         count = int(mask.sum())
         if not count:
@@ -359,7 +707,7 @@ def _method_auto_correct_anomalies(df: pd.DataFrame, report: Dict[str, Any]) -> 
         report["operations"]["anomaliesCorrected"][str(col)] = (
             report["operations"]["anomaliesCorrected"].get(str(col), 0) + count
         )
-    return out, {"anomaliesCorrected": corrected_by_col}
+    return out, {"anomaliesCorrected": corrected_by_col, "detector": algorithm}
 
 
 UNIT_DIMENSION_SPECS: List[Dict[str, Any]] = [
@@ -521,8 +869,10 @@ def _find_paired_unit_column(columns: Iterable[Any], value_column: Any, spec: Di
     direct_names.append(value_text.replace("_value", "_unit").replace("value", "unit").replace("值", "单位"))
 
     for direct_name in direct_names:
+        if direct_name == value_text:
+            continue
         for col in column_list:
-            if str(col) == direct_name:
+            if col != value_column and str(col) == direct_name:
                 return col
 
     value_compact = _compact_token(value_column)
@@ -535,7 +885,11 @@ def _find_paired_unit_column(columns: Iterable[Any], value_column: Any, spec: Di
     return None
 
 
-def _method_unit_dimension_check(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _method_unit_dimension_check(
+    df: pd.DataFrame,
+    report: Dict[str, Any],
+    algorithm: str = "combined_unit_rules",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = df.copy()
     converted_by_col: Dict[str, int] = {}
     checked_dimensions: Dict[str, str] = {}
@@ -565,8 +919,15 @@ def _method_unit_dimension_check(df: pd.DataFrame, report: Dict[str, Any]) -> Tu
                 continue
 
             paired_unit_text = out.at[row_idx, unit_col] if unit_col is not None else None
-            raw_unit_text = cell_unit_text or paired_unit_text
-            source_unit = _match_unit_key(raw_unit_text, spec) if raw_unit_text is not None else label_unit
+            if algorithm == "label_unit_mapping":
+                raw_unit_text = None
+                source_unit = label_unit
+            elif algorithm == "cell_unit_parsing":
+                raw_unit_text = cell_unit_text or paired_unit_text
+                source_unit = _match_unit_key(raw_unit_text, spec) if raw_unit_text is not None else None
+            else:
+                raw_unit_text = cell_unit_text or paired_unit_text
+                source_unit = _match_unit_key(raw_unit_text, spec) if raw_unit_text is not None else label_unit
             if raw_unit_text is not None and str(raw_unit_text).strip() and not source_unit:
                 unsupported_count += 1
                 converted_values.append(value)
@@ -604,10 +965,15 @@ def _method_unit_dimension_check(df: pd.DataFrame, report: Dict[str, Any]) -> Tu
         "unitConversions": converted_by_col,
         "dimensionChecks": checked_dimensions,
         "unsupportedUnits": unsupported_units,
+        "unitStrategy": algorithm,
     }
 
 
-def _method_engineering_constraint_check(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _method_engineering_constraint_check(
+    df: pd.DataFrame,
+    report: Dict[str, Any],
+    algorithm: str = "boundary_clip",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = df.copy()
     corrected_by_col: Dict[str, int] = {}
     monotonic_by_col: Dict[str, int] = {}
@@ -629,10 +995,13 @@ def _method_engineering_constraint_check(df: pd.DataFrame, report: Dict[str, Any
         upper = spec.get("max")
         if lower is not None:
             correction_mask = correction_mask | (corrected < lower).fillna(False)
-            corrected = corrected.mask(corrected < lower, lower)
         if upper is not None:
             correction_mask = correction_mask | (corrected > upper).fillna(False)
-            corrected = corrected.mask(corrected > upper, upper)
+
+        if algorithm == "invalid_to_missing":
+            corrected = corrected.mask(correction_mask)
+        elif algorithm != "constraint_flag":
+            corrected = corrected.clip(lower=lower, upper=upper)
 
         jump_factor = spec.get("jumpFactor")
         jump_delta = spec.get("jumpDelta")
@@ -645,7 +1014,10 @@ def _method_engineering_constraint_check(df: pd.DataFrame, report: Dict[str, Any
                 & ((corrected - prev).abs() > float(jump_delta))
             )
             correction_mask = correction_mask | jump_mask.fillna(False)
-            corrected = corrected.mask(jump_mask, prev)
+            if algorithm == "invalid_to_missing":
+                corrected = corrected.mask(jump_mask)
+            elif algorithm != "constraint_flag":
+                corrected = corrected.mask(jump_mask, prev)
 
         correction_count = int(correction_mask.sum())
         if correction_count:
@@ -660,19 +1032,60 @@ def _method_engineering_constraint_check(df: pd.DataFrame, report: Dict[str, Any
             monotonic_count = int(monotonic_mask.sum())
             if monotonic_count:
                 monotonic_by_col[str(col)] = monotonic_count
-                corrected = corrected.mask(monotonic_mask, cumulative_max)
+                if algorithm == "invalid_to_missing":
+                    corrected = corrected.mask(monotonic_mask)
+                elif algorithm != "constraint_flag":
+                    corrected = corrected.mask(monotonic_mask, cumulative_max)
                 report["operations"]["monotonicCorrections"][str(col)] = (
                     report["operations"]["monotonicCorrections"].get(str(col), 0) + monotonic_count
                 )
 
-        if correction_count or monotonic_by_col.get(str(col)):
+        if algorithm == "constraint_flag":
+            flag_name = f"{col}_constraint_valid"
+            out[flag_name] = ~(correction_mask | monotonic_mask if spec.get("monotonic") else correction_mask)
+        elif correction_count or monotonic_by_col.get(str(col)):
             out[col] = corrected
 
-    return out, {"constraintCorrections": corrected_by_col, "monotonicCorrections": monotonic_by_col}
+    return out, {
+        "constraintCorrections": corrected_by_col,
+        "monotonicCorrections": monotonic_by_col,
+        "constraintStrategy": algorithm,
+    }
 
 
-def _method_schema_standardize(df: pd.DataFrame, report: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _method_schema_standardize(
+    df: pd.DataFrame,
+    report: Dict[str, Any],
+    algorithm: str = "schema_mapping",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = df.copy()
+    if algorithm in {"min_max", "z_score"}:
+        normalized_columns: List[str] = []
+        skipped_columns: List[str] = []
+        for col in out.columns:
+            if str(col).startswith("_source_") or not pd.api.types.is_numeric_dtype(out[col]):
+                continue
+            series = _to_numeric(out[col])
+            if algorithm == "min_max":
+                minimum = series.min()
+                spread = series.max() - minimum
+                if pd.isna(spread) or spread == 0:
+                    skipped_columns.append(str(col))
+                    continue
+                out[col] = (series - minimum) / spread
+            else:
+                mean = series.mean()
+                std = series.std(ddof=0)
+                if pd.isna(std) or std == 0:
+                    skipped_columns.append(str(col))
+                    continue
+                out[col] = (series - mean) / std
+            normalized_columns.append(str(col))
+        return out, {
+            "normalization": algorithm,
+            "normalizedColumns": normalized_columns,
+            "skippedConstantColumns": skipped_columns,
+        }
     rename_map: Dict[str, str] = {}
     normalized_columns: List[str] = []
     for idx, col in enumerate(out.columns):
@@ -715,6 +1128,8 @@ def _read_tables(source: Path, config: Dict[str, Any], report: Dict[str, Any]) -
         data = json.loads(source.read_text(encoding="utf-8"))
         records = _json_to_records(data)
         return [("Json", pd.DataFrame(records))]
+    if suffix == ".las":
+        return [("LAS", _read_las(source))]
     report["warnings"].append(f"Unsupported file suffix: {suffix}")
     raise ValueError(f"Unsupported tabular file type: {suffix}")
 
@@ -730,6 +1145,60 @@ def _read_csv(source: Path, header: Optional[int]) -> pd.DataFrame:
     if last_error:
         raise last_error
     return pd.read_csv(source, header=header)
+
+
+def _read_las(source: Path) -> pd.DataFrame:
+    """Read the curve and ASCII sections of a LAS 2.x file without network-only dependencies."""
+    text = ""
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
+        try:
+            text = source.read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if not text:
+        raise ValueError(f"Unable to decode LAS file: {source.name}")
+
+    section = ""
+    curve_names: List[str] = []
+    rows: List[List[float]] = []
+    null_value: Optional[float] = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("~"):
+            section = line[1:].strip().lower()
+            continue
+        if section.startswith("well") and line.upper().startswith("NULL"):
+            match = re.search(r"\.\s*[^\s]*\s+([-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?)", line)
+            if match:
+                null_value = float(match.group(1))
+            continue
+        if section.startswith("curve"):
+            mnemonic = line.split(".", 1)[0].strip().split()[0] if "." in line else line.split()[0]
+            if mnemonic:
+                curve_names.append(mnemonic)
+            continue
+        if section.startswith("ascii") or section == "a":
+            try:
+                values = [float(value) for value in line.replace(",", " ").split()]
+            except ValueError:
+                continue
+            if values:
+                rows.append(values)
+
+    if not rows:
+        raise ValueError(f"LAS file contains no ASCII curve data: {source.name}")
+    width = max(len(row) for row in rows)
+    headers = curve_names[:width] + [f"CURVE_{index + 1}" for index in range(len(curve_names), width)]
+    normalized_rows: List[List[Any]] = [headers]
+    for row in rows:
+        padded: List[Any] = row[:width] + [None] * max(0, width - len(row))
+        if null_value is not None:
+            padded = [None if isinstance(value, float) and math.isclose(value, null_value) else value for value in padded]
+        normalized_rows.append(padded)
+    return pd.DataFrame(normalized_rows)
 
 
 def _json_to_records(data: Any) -> List[Dict[str, Any]]:
